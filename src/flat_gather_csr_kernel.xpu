@@ -1,0 +1,96 @@
+#include "xpu/kernel/xtdk.h"
+#include "xpu/kernel/xtdk_simd.h"
+#include "xpu/runtime.h"
+
+namespace {
+
+constexpr int kMaxChannels = 128;
+constexpr int kEdgeBlock = 64;
+
+__global__ void flat_gather_csr_backward_kernel(
+    const float* grad_edges,
+    const int* row_ptr,
+    const int* edge_ids,
+    float* grad_values,
+    int num_rows,
+    int channels) {
+    const int cores = core_num();
+    const int worker = cores * cluster_id() + core_id();
+    const int workers = cores * cluster_num();
+
+    __simd__ float accum[kMaxChannels];
+    __simd__ float edge_grad[kMaxChannels];
+    __simd__ int local_edge_ids[kEdgeBlock];
+    __simd__ int bounds[2];
+
+    const float32x16_t zero(0.0f);
+    for (int row = worker; row < num_rows; row += workers) {
+        for (int channel = 0; channel < channels; channel += 16) {
+            vstore_lm_float32x16(accum + channel, zero);
+        }
+        mfence_lm();
+
+        GM2LM(row_ptr + row, bounds, 2 * sizeof(int));
+        mfence();
+        const int begin = bounds[0];
+        const int end = bounds[1];
+
+        for (int position = begin; position < end;) {
+            const int remaining = end - position;
+            const int block_size = remaining < kEdgeBlock ? remaining : kEdgeBlock;
+            GM2LM(
+                edge_ids + position,
+                local_edge_ids,
+                block_size * sizeof(int));
+            mfence();
+
+            for (int local_edge = 0; local_edge < block_size; ++local_edge) {
+                const int edge = local_edge_ids[local_edge];
+                GM2LM(
+                    grad_edges +
+                        static_cast<long long>(edge) * channels,
+                    edge_grad,
+                    channels * sizeof(float));
+                mfence();
+                for (int channel = 0; channel < channels; channel += 16) {
+                    const float32x16_t old_value =
+                        vload_lm_float32x16(accum + channel);
+                    const float32x16_t add_value =
+                        vload_lm_float32x16(edge_grad + channel);
+                    vstore_lm_float32x16(
+                        accum + channel,
+                        vvadd_float32x16(old_value, add_value));
+                }
+                mfence();
+            }
+            position += block_size;
+        }
+
+        mfence();
+        LM2GM(
+            accum,
+            grad_values +
+                static_cast<long long>(row) * channels,
+            channels * sizeof(float));
+        mfence();
+    }
+}
+
+}  // namespace
+
+extern "C" void p800_launch_flat_gather_csr_backward(
+    const float* grad_edges,
+    const int* row_ptr,
+    const int* edge_ids,
+    float* grad_values,
+    int num_rows,
+    int channels,
+    void* stream) {
+    flat_gather_csr_backward_kernel<<<12, 64, stream>>>(
+        grad_edges,
+        row_ptr,
+        edge_ids,
+        grad_values,
+        num_rows,
+        channels);
+}
